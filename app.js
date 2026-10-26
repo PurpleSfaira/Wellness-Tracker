@@ -15,7 +15,32 @@ const Calc={
   sleepHrs(bed,wake){const t=s=>{const[h,m]=s.split(':').map(Number);return h*60+m};let d=t(wake)-t(bed);if(d<=0)d+=1440;return Math.round(d/6)/10}
 };
 const METS=[['Walking (slow, 2 mph)',2.8],['Walking (3 mph)',3.5],['Brisk walking (3.5–4 mph)',4.3],['Stroller walk / carrying baby',3.8],['Hiking',6],['Running (5 mph)',8.3],['Running (6 mph)',9.8],['Cycling (leisure)',4],['Cycling (moderate)',6.8],['Stationary bike',5.5],['Elliptical',5],['Strength training',3.5],['Strength training (vigorous)',6],['Postnatal / Pilates',3],['Yoga',2.5],['Swimming (easy)',6],['Dancing',5],['HIIT / circuit',8],['Housework (general)',3.3],['Vacuuming / mopping',3.5],['Gardening / yard work',4],['Shoveling snow',5.3],['Cross-country skiing',9],['Ice skating',5.5],['Playing with kids (active)',4]];
-if(typeof module!=='undefined'){module.exports={Calc,METS};}
+function numOrNull(v){if(v==null||v==='')return null;const n=+v;return Number.isFinite(n)?n:null}
+function round1(n){return Math.round((+n||0)*10)/10}
+function brandOf(p){let b=p&&p.brands;if(Array.isArray(b))b=b.join(', ');return String(b||'').split(',')[0].trim()}
+function gramsFromServing(s){if(!s)return null;const m=String(s).replace(',','.').match(/([\d.]+)\s*g\b/i);if(!m)return null;const g=+m[1];return g>0&&g<2000?g:null}
+// Open Food Facts product -> per-serving (or per 100 g) nutrition. Null when there is no name.
+function offFood(p){
+  if(!p||typeof p!=='object')return null;
+  const name=String(p.product_name||p.product_name_en||'').trim();
+  if(!name)return null;
+  const brand=brandOf(p);
+  const n=p.nutriments||{};
+  const kcalS=numOrNull(n['energy-kcal_serving']),kcal100=numOrNull(n['energy-kcal_100g']);
+  const kjS=numOrNull(n['energy-kj_serving']),kj100=numOrNull(n['energy-kj_100g']);
+  const grams=gramsFromServing(p.serving_size);
+  let suf=null,scale=1,serv='',cal=null;
+  if(kcalS!=null){suf='_serving';serv=p.serving_size||'1 serving';cal=kcalS}
+  else if(kjS!=null){suf='_serving';serv=p.serving_size||'1 serving';cal=kjS/4.184}
+  else if(grams&&kcal100!=null){suf='_100g';scale=grams/100;serv=String(p.serving_size);cal=kcal100*scale}
+  else if(grams&&kj100!=null){suf='_100g';scale=grams/100;serv=String(p.serving_size);cal=(kj100/4.184)*scale}
+  else if(kcal100!=null){suf='_100g';serv='100 g';cal=kcal100}
+  else if(kj100!=null){suf='_100g';serv='100 g';cal=kj100/4.184}
+  else serv=p.serving_size||'';
+  const macro=k=>{if(!suf)return 0;const v=numOrNull(n[k+suf]);return round1((v||0)*scale)};
+  return {name,brand,serv,cal:cal==null?null:Math.round(cal),p:macro('proteins'),c:macro('carbohydrates'),f:macro('fat'),fi:macro('fiber'),code:String(p.code||'')};
+}
+if(typeof module!=='undefined'){module.exports={Calc,METS,offFood};}
 else{
 // ---------- state ----------
 const K='jamieTracker.v1';
@@ -70,33 +95,146 @@ V.dash=()=>{const t=totals(cur),b=Calc.budget(prof()),rem=t.budget+t.ex-t.eat;
 window.addW=n=>{day(cur).water=(day(cur).water||0)+n;if(day(cur).water<0)day(cur).water=0;save();R()};
 
 const MEALS=['Breakfast','Lunch','Dinner','Snacks'];
-V.food=()=>{const D=day(cur);let h=dateBar();
+let findMeal='',found=[],searchGen=0,searchTimer=0;
+let scanStream=null,scanTimer=null,scanControls=null,scanStop=false,scanBusy=false,lookupGen=0;
+function mealDefault(){const h=new Date().getHours();return h<11?'Breakfast':h<15?'Lunch':h<21?'Dinner':'Snacks'}
+function selectedMeal(){const el=$('fmeal');return (el&&el.value)||findMeal||mealDefault()}
+function savedRow(f,i,src){const uses=f.uses||1;
+  return `<div class="it"><span>${esc(f.name)} <span class="mu">${esc(f.serv||'')} · ${f.cal} cal${src!=='my'&&uses>1?' · '+uses+'×':''}</span></span><span class="row" style="flex:0;gap:4px"><input class="qty" id="q${src}${i}" type="number" min="0.25" step="0.25" value="1" aria-label="Servings of ${esc(f.name)}"><button class="g" onclick="quickQty('${src}',${i})">+</button>${src==='my'?`<button class="x" onclick="delMy(${i})">✕</button>`:''}</span></div>`}
+function finderCard(){const meal=findMeal||mealDefault();
+  const freq=S.recents.map((f,i)=>({f,i})).filter(x=>(x.f.uses||1)>1).sort((a,b)=>(b.f.uses||1)-(a.f.uses||1)||(b.f.last||0)-(a.f.last||0)).slice(0,8);
+  const rec=S.recents.map((f,i)=>({f,i})).slice(0,8);
+  return `<div class="card" id="finder"><h2>Add food</h2>
+  <label>Meal</label><select id="fmeal" onchange="findMeal=this.value">${MEALS.map(m=>`<option ${m===meal?'selected':''}>${m}</option>`).join('')}</select>
+  <label>Search foods</label>
+  <div class="row"><input id="fqry" placeholder="Try Greek yogurt, oats, banana" autocomplete="off" enterkeyhint="search" oninput="queueSearch()" onkeydown="if(event.key==='Enter'){event.preventDefault();searchFoods()}"><button style="flex:0" onclick="searchFoods()">Search</button></div>
+  <div id="fstatus" class="mu"></div><div id="fresults"></div>
+  <div class="row"><button class="s" type="button" style="flex:0" id="scanbtn" onclick="toggleScan()">Scan barcode</button><input id="bcode" inputmode="numeric" autocomplete="off" placeholder="Or type barcode" onkeydown="if(event.key==='Enter'){event.preventDefault();lookupBarcode()}"><button class="s" type="button" style="flex:0" onclick="lookupBarcode()">Look up</button></div>
+  <div id="scanbox" class="hide"><video id="scanvid" playsinline webkit-playsinline muted autoplay></video><p class="mu" id="scanmsg"></p><button class="s" type="button" onclick="stopScan()">Stop camera</button></div>
+  <p class="mu">Nutrition lookup uses Open Food Facts and needs a connection. Saved foods and manual entry work offline.</p>
+  <h3>Or enter it yourself</h3>
+  <input id="fn" placeholder="Food name" autocomplete="off"><div class="row"><input id="fs" placeholder="Serving size (e.g. 1 cup)"><div style="flex:0.7"><label>Servings</label><input id="fq" type="number" min="0.25" step="0.25" value="1" oninput="previewFood()"></div></div>
+  <label>Calories per serving</label><input id="fc" type="number" inputmode="decimal" placeholder="Calories per serving" oninput="previewFood()">
+  <div class="grid"><input id="fp" type="number" placeholder="Protein g" oninput="previewFood()"><input id="fcb" type="number" placeholder="Carbs g" oninput="previewFood()"><input id="ff" type="number" placeholder="Fat g" oninput="previewFood()"><input id="ffi" type="number" placeholder="Fiber g" oninput="previewFood()"></div>
+  <div id="fpreview"></div>
+  <label><input type="checkbox" id="fsave" style="width:auto"> Save to My Foods</label><br>
+  <button onclick="addF()">Add</button><button class="s" onclick="quickCal()">Quick-add calories only</button>
+  <h3>Frequent</h3>${freq.length?freq.map(({f,i})=>savedRow(f,i,'freq')).join(''):'<p class="mu">Foods you log again show up here for one tap re-add.</p>'}
+  <h3>Recent</h3>${rec.length?rec.map(({f,i})=>savedRow(f,i,'rec')).join(''):'<p class="mu">None yet</p>'}
+  <h3>My Foods</h3><input placeholder="Search my foods" oninput="document.querySelectorAll('.myf').forEach(e=>e.style.display=e.dataset.n.includes(this.value.toLowerCase())?'':'none')">
+  ${S.myFoods.map((f,j)=>`<div class="myf" data-n="${esc(String(f.name||'').toLowerCase())}">${savedRow(f,j,'my')}</div>`).join('')||'<p class="mu">None yet</p>'}</div>`}
+V.food=()=>{const D=day(cur);let h=dateBar()+finderCard();
   MEALS.forEach(m=>{const it=D.food.map((f,i)=>[f,i]).filter(([f])=>f.meal===m);
     h+=`<div class="card"><h2>${m} <span class="mu">${sum(it.map(x=>x[0]),'cal')} cal</span></h2>${it.map(([f,i])=>`<div class="it"><span>${esc(f.name)} <span class="mu">${esc(f.serv||'')}</span></span><span>${f.cal} <button class="x" onclick="delF(${i})">✕</button></span></div>`).join('')}
     <button class="s" onclick="openAdd('${m}')">+ Add food</button></div>`});
-  return h+`<div id="addbox"></div>`};
+  return h};
 window.delF=i=>{day(cur).food.splice(i,1);save();R()};
-window.openAdd=m=>{const q=(f,j,src)=>`<div class="it"><span>${esc(f.name)} <span class="mu">${esc(f.serv||'')} · ${f.cal} cal</span></span><span><button class="g" onclick="quick('${src}',${j},'${m}')">+</button>${src==='my'?`<button class="x" onclick="delMy(${j})">✕</button>`:''}</span></div>`;
-  $('addbox').innerHTML=`<div class="card" id="ab"><h2>Add to ${m}</h2>
-  <input id="fn" placeholder="Food name"><div class="row"><input id="fs" placeholder="Serving (e.g. 1 cup)"><input id="fq" type="number" step="0.25" value="1" placeholder="× servings"></div>
-  <input id="fc" type="number" inputmode="decimal" placeholder="Calories per serving">
-  <div class="grid"><input id="fp" type="number" placeholder="Protein g"><input id="fcb" type="number" placeholder="Carbs g"><input id="ff" type="number" placeholder="Fat g"><input id="ffi" type="number" placeholder="Fiber g"></div>
-  <label><input type="checkbox" id="fsave" style="width:auto"> Save to My Foods</label><br>
-  <button onclick="addF('${m}')">Add</button><button class="s" onclick="quickCal('${m}')">Quick-add calories only</button>
-  <h3>Recent</h3>${S.recents.map((f,j)=>q(f,j,'rec')).join('')||'<p class="mu">None yet</p>'}
-  <h3>My Foods</h3><input placeholder="Search my foods" oninput="document.querySelectorAll('.myf').forEach(e=>e.style.display=e.textContent.toLowerCase().includes(this.value.toLowerCase())?'':'none')">
-  ${S.myFoods.map((f,j)=>`<div class="myf">${q(f,j,'my')}</div>`).join('')||'<p class="mu">None yet</p>'}</div>`;$('ab').scrollIntoView({behavior:'smooth'})};
-function pushFood(f,m){const e=Object.assign({},f,{meal:m});day(cur).food.push(e);
-  const base={name:f.name,serv:f.serv,cal:f.baseCal??f.cal,p:f.bp??f.p,c:f.bc??f.c,f:f.bf??f.f,fi:f.bfi??f.fi};
-  S.recents=[base,...S.recents.filter(r=>!(r.name===base.name&&r.cal===base.cal))].slice(0,15);save();R()}
-window.addF=m=>{const n=$('fn').value.trim(),c=+$('fc').value,q=+$('fq').value||1;if(!n||!c&&c!==0||!$('fc').value){alert('Enter a name and calories');return}
-  const v=id=>$(id).value===''?0:+$(id).value;const base={name:n,serv:$('fs').value,cal:c,p:v('fp'),c:v('fcb'),f:v('ff'),fi:v('ffi')};
-  if($('fsave').checked)S.myFoods.push(base);
-  pushFood({name:n,serv:(q!==1?q+' × ':'')+base.serv,cal:Math.round(c*q),p:base.p*q,c:base.c*q,f:base.f*q,fi:base.fi*q,baseCal:c,bp:base.p,bc:base.c,bf:base.f,bfi:base.fi},m)};
-window.quick=(src,j,m)=>{const f=(src==='my'?S.myFoods:S.recents)[j];const q=+prompt(`Servings of ${f.name} (${f.serv||'1 serving'})?`,'1');if(!q)return;
-  pushFood({name:f.name,serv:(q!==1?q+' × ':'')+(f.serv||''),cal:Math.round(f.cal*q),p:(f.p||0)*q,c:(f.c||0)*q,f:(f.f||0)*q,fi:(f.fi||0)*q,baseCal:f.cal,bp:f.p,bc:f.c,bf:f.f,bfi:f.fi},m)};
+window.openAdd=m=>{findMeal=m;const sel=$('fmeal');if(sel)sel.value=m;const box=$('finder');if(box)box.scrollIntoView({behavior:'smooth'});const q=$('fqry');if(q)q.focus()};
+function rememberFood(base){const same=r=>r.name===base.name&&(r.serv||'')===(base.serv||'')&&r.cal===base.cal;
+  const prev=S.recents.find(same);
+  const item=Object.assign({},base,{uses:((prev&&prev.uses)||0)+1,last:Date.now()});
+  S.recents=[item,...S.recents.filter(r=>!same(r))].slice(0,40)}
+function pushFood(f,m){day(cur).food.push(Object.assign({},f,{meal:m}));
+  rememberFood({name:f.name,serv:f.baseServ!=null?f.baseServ:(f.serv||''),cal:f.baseCal??f.cal,p:f.bp??f.p,c:f.bc??f.c,f:f.bf??f.f,fi:f.bfi??f.fi});
+  save();R()}
+window.addF=()=>{const m=selectedMeal();const n=$('fn').value.trim();const raw=$('fc').value;const c=+raw;const q=+$('fq').value||1;
+  if(!n||raw===''||!Number.isFinite(c)){alert('Enter a name and calories');return}
+  if(q<=0){alert('Enter servings greater than 0');return}
+  const v=id=>{const x=$(id).value;return x===''?0:+x};
+  const base={name:n,serv:$('fs').value,cal:c,p:v('fp'),c:v('fcb'),f:v('ff'),fi:v('ffi')};
+  if($('fsave')&&$('fsave').checked&&!S.myFoods.some(x=>x.name===base.name&&x.serv===base.serv&&x.cal===base.cal))S.myFoods.push(base);
+  pushFood({name:n,serv:(q!==1?q+' × ':'')+base.serv,baseServ:base.serv,cal:Math.round(c*q),p:base.p*q,c:base.c*q,f:base.f*q,fi:base.fi*q,baseCal:c,bp:base.p,bc:base.c,bf:base.f,bfi:base.fi},m)};
+window.quickQty=(src,j)=>{const list=src==='my'?S.myFoods:S.recents;const f=list[j];if(!f)return;
+  const el=$('q'+src+j);const q=el?(+el.value||0):0;if(!q||q<=0){alert('Enter servings greater than 0');return}
+  pushFood({name:f.name,serv:(q!==1?q+' × ':'')+(f.serv||''),baseServ:f.serv||'',cal:Math.round((f.cal||0)*q),p:(f.p||0)*q,c:(f.c||0)*q,f:(f.f||0)*q,fi:(f.fi||0)*q,baseCal:f.cal,bp:f.p,bc:f.c,bf:f.f,bfi:f.fi},selectedMeal())};
 window.delMy=j=>{if(confirm('Remove from My Foods?')){S.myFoods.splice(j,1);save();R()}};
-window.quickCal=m=>{const c=+prompt('Calories to quick-add:');if(c){day(cur).food.push({name:'Quick add',cal:Math.round(c),meal:m,p:0,c:0,f:0,fi:0});save();R()}};
+window.quickCal=()=>{const m=selectedMeal();const c=+prompt('Calories to quick-add:');if(c){day(cur).food.push({name:'Quick add',cal:Math.round(c),meal:m,p:0,c:0,f:0,fi:0});save();R()}};
+function failMsg(e){if(e&&e.name==='AbortError')return 'The food database took too long. Try again, or enter the food manually.';
+  if(typeof navigator!=='undefined'&&navigator.onLine===false)return "You're offline. Search and barcode lookup need a connection. Use a saved food or enter it manually.";
+  return "The food database didn't respond. Try again in a moment, or enter the food manually."}
+function offJSON(url){const c=new AbortController();const t=setTimeout(()=>c.abort(),12000);
+  return fetch(url,{signal:c.signal,headers:{Accept:'application/json'}}).then(r=>{if(!r.ok)throw new Error('HTTP '+r.status);return r.json()}).finally(()=>clearTimeout(t))}
+function resultHTML(f,i){const macros=f.cal==null?'No nutrition data':`${f.cal} cal · P ${f.p}g · C ${f.c}g · F ${f.f}g${f.fi?' · Fiber '+f.fi+'g':''}`;
+  return `<div class="it"><span><b>${esc(f.name)}</b>${f.brand?` <span class="mu">${esc(f.brand)}</span>`:''}<br><span class="mu">${esc(f.serv||'Serving not listed')} · ${macros}</span></span><button class="g" style="flex:0" onclick="pickFood(${i})">Use</button></div>`}
+function fillFood(f){if(!$('fn'))return;
+  $('fn').value=f.brand?f.name+' ('+f.brand+')':f.name;
+  $('fs').value=f.serv||'';
+  $('fc').value=f.cal==null?'':f.cal;
+  $('fp').value=f.p?f.p:'';$('fcb').value=f.c?f.c:'';$('ff').value=f.f?f.f:'';$('ffi').value=f.fi?f.fi:'';
+  if(!$('fq').value)$('fq').value=1;
+  window.previewFood();$('fq').focus()}
+window.previewFood=()=>{const el=$('fpreview');if(!el||!$('fc'))return;const raw=$('fc').value;const q=+$('fq').value;
+  if(raw===''||!(q>0)){el.textContent='';return}
+  const g=id=>{const v=$(id).value;return v===''?0:+v};const r=n=>Math.round(n*10)/10;
+  el.textContent=q+' serving'+(q===1?'':'s')+' → '+Math.round((+raw)*q)+' cal · P '+r(g('fp')*q)+'g · C '+r(g('fcb')*q)+'g · F '+r(g('ff')*q)+'g · Fiber '+r(g('ffi')*q)+'g'};
+window.pickFood=i=>{const f=found[i];if(!f)return;fillFood(f);
+  const st=$('fstatus');if(st)st.textContent=f.cal==null?'Filled in the name, but this product has no calorie data. Add calories, then tap Add.':'Filled in. Adjust servings if you need to, then tap Add.'};
+window.queueSearch=()=>{clearTimeout(searchTimer);const q=$('fqry')&&$('fqry').value.trim();
+  if(!q){found=[];if($('fresults'))$('fresults').innerHTML='';if($('fstatus'))$('fstatus').textContent='';return}
+  if(q.length<2)return;searchTimer=setTimeout(()=>window.searchFoods(),600)};
+window.searchFoods=async()=>{clearTimeout(searchTimer);const input=$('fqry');if(!input)return;const q=input.value.trim();const st=$('fstatus'),box=$('fresults');
+  if(q.length<2){if(st)st.textContent='Type at least 2 characters to search.';if(box)box.innerHTML='';return}
+  const gen=++searchGen;if(st)st.textContent='Searching…';if(box)box.innerHTML='';
+  const url='https://world.openfoodfacts.org/cgi/search.pl?'+new URLSearchParams({search_terms:q,search_simple:'1',action:'process',json:'1',page_size:'12',fields:'code,product_name,product_name_en,brands,serving_size,nutriments',sort_by:'unique_scans_n'}).toString();
+  let list=null,lastErr=null;
+  for(let attempt=0;attempt<2;attempt++){try{const d=await offJSON(url);list=d.products||[];break}catch(e){if(gen!==searchGen)return;lastErr=e;if(attempt===0)await new Promise(r=>setTimeout(r,1200))}}
+  if(gen!==searchGen)return;
+  if(!list){if(st)st.textContent=failMsg(lastErr);return}
+  const mapped=[];const seen=new Set();
+  for(const p of list){const f=offFood(p);if(!f)continue;const k=(f.name+'|'+f.brand+'|'+(f.cal==null?'':f.cal)+'|'+f.serv).toLowerCase();if(seen.has(k))continue;seen.add(k);mapped.push(f)}
+  mapped.sort((a,b)=>(a.cal==null)-(b.cal==null));found=mapped.slice(0,8);
+  if(!found.length){if(st)st.textContent='No foods found for "'+q+'". Try a simpler name, or enter it manually below.';return}
+  if(st)st.textContent=found.length+' result'+(found.length===1?'':'s')+'. Tap Use. Numbers are per serving, or per 100 g when a serving is not listed.';
+  if(box)box.innerHTML=found.map(resultHTML).join('')};
+window.lookupBarcode=async(code)=>{const raw=String(code==null?($('bcode')&&$('bcode').value||''):code);const digits=raw.replace(/\D/g,'');const st=$('fstatus');
+  if(!/^\d{6,14}$/.test(digits)){if(st)st.textContent=raw.trim()?'That code is not a numeric barcode. Type the number printed under the bars.':'Enter a barcode (6-14 digits), or scan one.';return}
+  const gen=++lookupGen;if($('bcode'))$('bcode').value=digits;if(st)st.textContent='Looking up '+digits+'…';
+  const fields='fields=code,product_name,product_name_en,brands,serving_size,nutriments,status';
+  try{let d=await offJSON('https://world.openfoodfacts.org/api/v2/product/'+digits+'.json?'+fields);
+    if(gen!==lookupGen)return;
+    if((!d||d.status!==1||!d.product)&&digits.length===12){d=await offJSON('https://world.openfoodfacts.org/api/v2/product/0'+digits+'.json?'+fields);if(gen!==lookupGen)return}
+    if(!d||d.status!==1||!d.product){if($('fstatus'))$('fstatus').textContent='No product found for '+digits+'. Try another code or enter the food manually.';return}
+    const f=offFood(d.product);if(!f){if($('fstatus'))$('fstatus').textContent='That barcode has no product name. Enter the food manually.';return}
+    found=[f];if($('fresults'))$('fresults').innerHTML=resultHTML(f,0);fillFood(f);
+    if($('fstatus'))$('fstatus').textContent=f.cal==null?'Product found, but it has no calorie data. Fill in calories to log it.':'Filled in from the barcode. Adjust servings, then tap Add.';
+  }catch(e){if(gen===lookupGen&&$('fstatus'))$('fstatus').textContent=failMsg(e)}};
+function releaseCamera(){scanStop=true;if(scanTimer){clearTimeout(scanTimer);scanTimer=null}
+  if(scanControls){try{scanControls.stop()}catch(e){}scanControls=null}
+  if(scanStream){scanStream.getTracks().forEach(t=>t.stop());scanStream=null}
+  const vid=document.getElementById('scanvid');if(vid)vid.srcObject=null}
+window.stopScan=()=>{releaseCamera();const box=$('scanbox');if(box)box.classList.add('hide')};
+function loadScript(src){return new Promise((res,rej)=>{if(window.ZXingBrowser){res();return}
+  const s=document.createElement('script');s.src=src;s.async=true;s.onload=()=>res();s.onerror=()=>{s.remove();rej(new Error('script'))};document.head.appendChild(s)})}
+async function scanNative(msg){if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){msg.textContent='No camera is available. Type the barcode instead.';return}
+  let formats=['ean_13','ean_8','upc_a','upc_e','code_128','code_39'];
+  try{if(window.BarcodeDetector.getSupportedFormats){const sup=await window.BarcodeDetector.getSupportedFormats();const keep=formats.filter(f=>sup.includes(f));if(keep.length)formats=keep}}catch(e){}
+  let detector;try{detector=new window.BarcodeDetector({formats})}catch(e){msg.textContent='Camera scanning is not available in this browser. Type the barcode instead.';return}
+  try{const stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'}},audio:false});
+    if(scanStop){stream.getTracks().forEach(t=>t.stop());return}
+    scanStream=stream;const vid=$('scanvid');vid.srcObject=scanStream;await vid.play();if(scanStop){releaseCamera();return}
+    msg.textContent='Point the camera at a barcode.';
+    const tick=async()=>{if(scanStop)return;try{const codes=await detector.detect(vid);
+      if(codes&&codes[0]&&codes[0].rawValue){const raw=String(codes[0].rawValue);if($('bcode'))$('bcode').value=raw;window.stopScan();window.lookupBarcode(raw);return}}catch(e){}
+      if(!scanStop)scanTimer=setTimeout(tick,250)};
+    scanTimer=setTimeout(tick,300)}
+  catch(e){releaseCamera();const box=$('scanbox');if(box)box.classList.remove('hide');msg.textContent='Camera permission was blocked, or this device has no camera. Type the barcode instead.'}}
+async function scanZXing(msg){try{const reader=new window.ZXingBrowser.BrowserMultiFormatReader();const vid=$('scanvid');
+  msg.textContent='Point the camera at a barcode.';
+  const controls=await reader.decodeFromConstraints({video:{facingMode:{ideal:'environment'}},audio:false},vid,(result)=>{
+    if(scanStop||!result)return;const raw=typeof result.getText==='function'?result.getText():String(result.text||'');if(!raw)return;
+    if($('bcode'))$('bcode').value=raw;window.stopScan();window.lookupBarcode(raw)});
+  if(scanStop){try{controls.stop()}catch(e){}return}
+  scanControls=controls}
+  catch(e){releaseCamera();const box=$('scanbox');if(box)box.classList.remove('hide');msg.textContent='Camera permission was blocked, or this device has no camera. Type the barcode instead.'}}
+window.toggleScan=async()=>{if(scanStream||scanControls){window.stopScan();return}if(scanBusy)return;const box=$('scanbox');if(!box)return;
+  box.classList.remove('hide');const msg=$('scanmsg');scanStop=false;scanBusy=true;
+  try{let mode=null;
+    if('BarcodeDetector' in window && typeof window.BarcodeDetector==='function')mode='native';
+    else{if(msg)msg.textContent='Loading scanner…';try{await loadScript('vendor/zxing-browser.min.js');if(window.ZXingBrowser&&window.ZXingBrowser.BrowserMultiFormatReader)mode='zxing'}catch(e){}}
+    if(scanStop)return;
+    if(!mode){if(msg)msg.textContent='Camera scanning is not available in this browser (including iPhone Safari without the backup scanner). Type the barcode instead — lookup works the same way.';return}
+    if(mode==='native')await scanNative(msg);else await scanZXing(msg)}
+  finally{scanBusy=false}};
 
 V.ex=()=>{const D=day(cur),lb=lastW();return dateBar()+`<div class="card"><h2>👣 Steps</h2><div class="row"><input id="st" type="number" inputmode="numeric" value="${D.steps||''}" placeholder="Steps today"><button style="flex:0" onclick="day(cur).steps=+$('st').value||0;save();R()">Save</button></div>
   <div class="mu">${D.steps||0} steps ≈ <b>${Calc.stepKcal(D.steps||0,lb)}</b> cal (scaled to ${lb||150} lb)</div></div>
@@ -156,9 +294,16 @@ window.importD=inp=>{const f=inp.files[0];if(!f)return;f.text().then(t=>{try{con
 
 const TABS=[['dash','🏠','Home'],['food','🍽️','Food'],['ex','🏃‍♀️','Exercise'],['water','💧','Water'],['sleep','😴','Sleep'],['weight','⚖️','Weight'],['prof','👤','Me']];
 window.go=t=>{tab=t;R();scrollTo(0,0)};
-window.R=()=>{M.innerHTML=V[tab]();$('nav').innerHTML=TABS.map(([k,i,l])=>`<button class="${tab===k?'on':''}" onclick="go('${k}')"><b>${i}</b>${l}</button>`).join('')};
+window.R=()=>{releaseCamera();clearTimeout(searchTimer);searchGen++;lookupGen++;M.innerHTML=V[tab]();$('nav').innerHTML=TABS.map(([k,i,l])=>`<button class="${tab===k?'on':''}" onclick="go('${k}')"><b>${i}</b>${l}</button>`).join('')};
 window.day=day;window.save=save;window.$=$;Object.defineProperty(window,'S',{get:()=>S});Object.defineProperty(window,'cur',{get:()=>cur,set:v=>cur=v});
 Object.defineProperty(window,'sleepRange',{get:()=>sleepRange,set:v=>sleepRange=v});
 R();
-if('serviceWorker'in navigator)navigator.serviceWorker.register('sw.js');
+if('serviceWorker'in navigator){
+  let refreshing=false,had=!!navigator.serviceWorker.controller;
+  navigator.serviceWorker.addEventListener('controllerchange',()=>{
+    if(!had){had=true;return}
+    if(refreshing)return;refreshing=true;location.reload();
+  });
+  navigator.serviceWorker.register('sw.js');
+}
 }
